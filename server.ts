@@ -1,0 +1,705 @@
+/**
+ * Realtime Collaboration Server (Studysprout)
+ * -------------------------------------------
+ * This server manages:
+ * 1. Real-time Presence (Who is in which workspace/file)
+ * 2. Shared Document Editing (Yjs + Websockets)
+ * 3. AI Generation Locks (Preventing concurrent LLM calls)
+ * 4. Cross-tab synchronization via Redis/BullMQ
+*/
+
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
+import "dotenv/config";
+import config from "./config/config";
+import { decode } from "next-auth/jwt";
+import cors from "cors";
+import { ConnectionOptions, Queue } from "bullmq";
+import * as Y from "yjs";
+
+// creating HTTP server (socket.io attaches to this)
+const app = express();
+const server = http.createServer(app);
+
+/** * REDIS CONFIGURATION
+ * BullMQ requires Redis to manage background jobs like persisting Yjs docs to the main DB
+ */ 
+const redisConnection: ConnectionOptions = {
+  host: process.env.REDIS_HOST || "localhost",
+  port: parseInt(process.env.REDIS_POST || "6379"),
+  maxRetriesPerRequest: null, //Required for BullMQ
+}
+
+/** *IN_MEMORY STATE
+ * docs: Current Yjs document for live editing
+ * saveTimers: Debouncing logic to prevent hitting the database on every keystroke
+*/
+const docs = new Map<string, Y.Doc>();
+const saveTimers = new Map<string, NodeJS.Timeout>();
+
+// Queue for pushing file updates back to the Next.js main database
+const fileSyncQueue = new Queue("file-sync-queue", { 
+  connection: redisConnection 
+});
+// Initialize socket.io
+const io = new Server(server, {
+    cors: { origin: "*"}, //allow frontend connections 
+})
+
+/** *WORKSPACE PRESENCE TRACKING
+ * workspaceId -> userId -> Set of socketIds
+ * Using a Set for sockets allows a single user to have multiple tabs open without flickering
+ */ 
+const workspacePresence = new Map<
+    string,  //workspaceId
+    Map<
+    string, //userId
+    Set<string> //socketIds
+    >
+  >();
+
+/** *SOCKET AUTHENTICATION MIDDLEWARE 
+ * Decodes the NextAuth JWT to verify identify before allowing a connection
+ */
+io.use(async (socket, next) => {
+    const token = socket.handshake.auth.token;  //token sent from client
+   
+    // No token -> allows connection, but mark as authenticated
+    if(!token){
+      socket.data.user = null;
+      return next();
+    }
+
+    try {
+      // Decode NextAuth JWT (JWE)
+        const decoded = await decode({
+          token,
+          secret: config.NEXTAUTH_SECRET!,
+        })
+        
+        if(!decoded) return next(new Error("unauthenticated"));
+
+        // Attach user to socket for later use
+        socket.data.user = decoded;
+        return next();
+    } catch (error) {
+      // On decode failure, allow connection but unauthenticated
+      socket.data.user = null;
+      return  next();
+    }
+})
+/** *FILE PRESENCE TRACKING
+ * fileId -> userId -> user data (for avatar/cursor presence)
+ */
+const activeFileUsers = new Map<
+string, //fileId
+Map<string, {
+  userId: string;
+  username: string;
+  avatarUrl?: string;
+  sockets: Set<string>;   //for multi-tab support
+}> 
+>();
+
+/** *AI GENERATION LOCKS
+ * resourceId -> State object
+ * Prevents multiple users from calling the GEMINI API for the same file at the same time
+ */
+const activeGenerationLocks = new Map();
+
+/** *Helper: Broadcasts all current locks of a workspace to keep progress bars in sync for everyone
+ * 
+ */
+const broadcastWorkspaceLocks = (workspaceId: string) => {
+  const locks = Array.from(activeGenerationLocks.values())
+  .filter((lock: any) => String(lock.workspaceId) === String(workspaceId));
+
+  io.to(`workspace:${workspaceId}`).emit("workspace_locks_update", locks);
+}
+// Runs AFTER socket is connected
+io.on("connection", (socket) => {
+
+    /** *EVENT: Workspace Join
+     * Subscribe a user to a specific workspace "room" for presence updates
+     */
+    socket.on("workspace:join", ({ workspaceId }, ack) => {
+      // ensure auth at event level
+      if (!socket.data.user) {
+        socket.emit("workspace:denied", { reason: "unauthenticated" });
+        if(typeof ack === "function"){
+          ack({
+            ok: false,
+            reason: "unauthenticated"
+          });
+        }
+        return;
+      }
+
+      const userId = socket.data.user._id;
+
+      socket.data.currentWorkspaceId = workspaceId;
+
+      // Initialize workspace map
+      if(!workspacePresence.has(workspaceId)){
+        workspacePresence.set(workspaceId, new Map());
+      }
+
+      const usersMap = workspacePresence.get(workspaceId)!;
+
+      const sockets = usersMap.get(userId);
+      if(sockets && sockets.has(socket.id)){
+        if(typeof ack === "function"){
+          ack({ ok: true });
+        }
+
+        return;
+      }
+
+
+      // Initialize user socket set
+      if(!usersMap.has(userId)){
+        usersMap.set(userId, new Set());
+      }
+
+      usersMap.get(userId)!.add(socket.id);
+
+      // Join workspace-specific room
+      socket.join(`workspace:${workspaceId}`);
+
+    
+      io.to(`workspace:${workspaceId}`).emit("presence:update",{
+        workspaceId,
+        users: Array.from(usersMap.keys()),
+      });
+
+      if(typeof ack === "function"){
+        ack({ ok: true });
+      }
+    });
+
+    
+    socket.on("workspace:leave", ({ workspaceId }) => {
+      socket.leave(`workspace:${workspaceId}`);
+    });
+
+    /** *EVENT: AI Generation Request
+     * Handles hierarchical locking logic (preventing conflicts between parent folders and child files)
+     */
+    socket.on("request_gen_start", ({
+      resourceId,
+      parentId,
+      workspaceId,
+      username
+    }) => {
+      const rId = String(resourceId);
+      const pId = String(parentId);
+      const wId = String(workspaceId);
+      const name = String(username);
+      // 1. Direct Lock Check
+      if(activeGenerationLocks.has(rId)){
+        socket.emit("lock_denied", {
+           resourceId :rId,
+           reason: "already_locked", 
+          });
+        return;
+      }
+
+      //2. Upward Hierarchy Check (Is parent being processed?)
+      if(pId && activeGenerationLocks.has(pId)){
+        return socket.emit("lock_denied", {
+          resourceId: rId,
+          reason: "parent_locked",
+        });
+      }
+
+      //3. Downward Hierarchy Check (Are children being processed?)
+      for(const [id, state] of activeGenerationLocks.entries()){
+        if(state.pId === rId){
+          return socket.emit("lock_denied", {
+            resourceId: rId,
+            reason: "child_locked",
+          });
+        }
+      }
+
+      // Grant lock if all checks pass
+      const genState = {
+        ownerId: socket.id,
+        workspaceId: wId,
+        username: name || "Anonymous",
+        progress: 0,
+        resourceId: rId,
+        parentId: pId,
+        currentCount: 0,
+        totalCards: 0,
+      };
+
+      activeGenerationLocks.set(rId, genState);
+
+      socket.emit("lock_granted", { rId });
+
+      // Notify everyone in the workspace about the new process
+      // io.to(`workspace:${wId}`).emit("gen_status_update", genState);
+      broadcastWorkspaceLocks(wId);
+
+      // GHOST LOCK PROTECTION: Auto-release after 5 mins if client crashes
+      setTimeout(() => {
+        if(activeGenerationLocks.has(rId)){
+          const currentLock = activeGenerationLocks.get(rId);
+          if(currentLock.ownerId === socket.id){
+            activeGenerationLocks.delete(rId);
+            broadcastWorkspaceLocks(workspaceId);
+          }
+        }
+      }, 5*60*1000);
+    });
+
+    /** EVENT: Progress Reporting - Updating all clients on AI generation status */
+    socket.on("report_progress", ({
+      resourceId,
+      workspaceId,
+      progress,
+      currentCount,
+      totalCards,
+    }) => {
+      const state = activeGenerationLocks.get(resourceId);
+      if(state){
+        state.progress = progress;
+        state.currentCount = currentCount;
+        state.totalCards = totalCards;
+        broadcastWorkspaceLocks(workspaceId);
+      }
+    });
+
+    /**EVENT: Generation End - Releases the lock so others can use the resouce */
+    socket.on("request_gen_end", ({
+      resourceId,
+      workspaceId
+    }) => {
+      activeGenerationLocks.delete(resourceId);
+      broadcastWorkspaceLocks(workspaceId);
+      // Tell everyone to hide the progress bar
+      io.to(`workspace:${workspaceId}`).emit("gen_completed", { resourceId });
+
+      // Tell everyone to refresh their flashcard sheet list
+      io.to(`workspace:${workspaceId}`).emit("flashcard_set_completed", { resourceId });
+    });
+
+
+    socket.on("get_workspace_locks", ({ workspaceId }) => {
+      const activeLocks = Array.from(activeGenerationLocks.values())
+      .filter((lock: any) => String(lock.workspaceId) === String(workspaceId));
+      socket.emit("workspace_locks_update", activeLocks);
+    });
+
+   /** *CLEANUP: Handles disconnections
+    *   Removes user from presence maps and releases any active AI locks held by this socket
+    */
+  socket.on("disconnect", reason => {
+    const user = socket.data.user;
+    if(!user) return;
+    const userId = user._id;
+
+    //1. Presence Cleanup
+    if(socket.data.currentWorkspaceId){
+      const workspaceId = socket.data.currentWorkspaceId;
+      const usersMap = workspacePresence.get(workspaceId);
+
+      if(usersMap?.has(userId)){
+        const sockets = usersMap.get(userId);
+        sockets?.delete(socket.id);
+
+        if(sockets?.size === 0){
+          usersMap.delete(userId);
+
+          io.to(`workspace:${workspaceId}`).emit("presence:update", {
+            workspaceId,
+            users: Array.from(usersMap.keys()),
+          });
+        }
+        if(usersMap.size === 0){
+          workspacePresence.delete(workspaceId);
+        }
+      }
+    }
+
+    // 2. Optimized File Presence Cleanup
+    if(socket.data.currentFile){
+        const fileId = socket.data.currentFileId;
+        const usersInFile = activeFileUsers.get(fileId);
+
+        if(usersInFile?.has(userId)){
+          const session = usersInFile.get(userId);
+          session?.sockets.delete(socket.id);
+
+          if(session?.sockets.size === 0){
+            usersInFile.delete(userId);
+          }
+          if(usersInFile.size === 0){
+            activeFileUsers.delete(userId);
+          }else{
+            io.to(`file:${fileId}`).emit("file:presence", 
+              Array.from(usersInFile.values()).map(u => ({
+                userId: u.userId,
+                username: u.username,
+                avatarUrl: u.avatarUrl,
+              }))
+            );
+          }
+        }
+    }
+
+    // 3. AI Generation lock cleanup
+    for(const [resId, state ] of activeGenerationLocks.entries()){
+      if(state.ownerId === socket.id){
+        activeGenerationLocks.delete(resId);
+        // io.to(`workspace:${state.workspaceId}`).emit("gen_completed", {
+        //   resourceId: resId,
+        // });
+        broadcastWorkspaceLocks(state.workspaceId);
+      }
+    }
+
+    // 4. Title Editing cleanup
+    if(socket.data.editing){
+      const {workspaceId, itemId } = socket.data.editing;
+      socket.to(`workspace:${workspaceId}`).emit("presence:remote-editing-stop", { itemId });
+    }
+
+  });
+
+  
+  /** *EVENT: File Join
+     * Subscribe a user to a specific file "room" for presence updates
+     */
+  socket.on("file:join", ({ fileId }) => {
+    // 1. Validation
+    if(!socket.data.user || !fileId) return;
+
+    const { _id:userId , username, avatarUrl } = socket.data.user;
+
+    socket.data.currentFileId = fileId;
+
+    //2. Join the Socket.io Room
+    const roomName = `file:${fileId}`;
+    socket.join(roomName);
+
+    //3. Ensure the file room exists
+    if(!activeFileUsers.has(fileId)){
+      activeFileUsers.set(fileId, new Map());
+    }
+
+    const usersInFile = activeFileUsers.get(fileId);
+
+    if(!usersInFile) return;
+
+    // 4.Add or update user entry
+    if(!usersInFile.has(userId)){
+      usersInFile.set(userId, {
+        userId,
+        username,
+        avatarUrl,
+        sockets: new Set([socket.id]),
+      });
+    }else{
+      // User is already here in another tab, just add this socket
+      usersInFile.get(userId)!.sockets.add(socket.id);
+    }
+
+    // 5. Broadcast the current list 
+    const presenceList = Array.from(usersInFile?.values()).map(user => ({
+      userId: user.userId,
+      username: user.username,
+      avatarUrl: user.avatarUrl
+    }));
+
+    // Broadcast the array of user objects to everyone in the file
+    io.to(`file:${fileId}`).emit("file:presence",
+      presenceList
+    );
+
+    const doc = docs.get(fileId);
+    if(doc){
+      const state = Y.encodeStateAsUpdate(doc);
+      socket.emit("file:update-raw", state);
+    }else{
+      const newDoc = new Y.Doc();
+      newDoc.getXmlFragment("document-content");
+      docs.set(fileId, newDoc);
+    }
+  });
+
+  /** *YJS LIVE EDITING HANDLES
+   * Relay updates between users for shared document editing
+   */
+  socket.on("file:update-raw", ({ fileId, update }: {
+    fileId: string,
+    update: Uint8Array
+  }) => {
+    // 1. Live Relay 
+    socket.to(`file:${fileId}`).emit("file:update-raw", update);
+
+    // 2. Update the Server's "Mirror" Doc
+    // Sync server-side mirror and debounce database save
+    if(!docs.has(fileId)){
+      const newDoc = new Y.Doc();
+      newDoc.getXmlFragment("document-content");
+      docs.set(fileId, newDoc);
+    }
+    const doc = docs.get(fileId);
+    if(!doc) return;
+      try {
+        Y.applyUpdate(doc, new Uint8Array(update));
+        // 3. Debounce the Save job
+    // Wait for 2 sec of silence before asking the Worker to save to DB
+    clearTimeout(saveTimers.get(fileId));
+
+    const timer = setTimeout(async() => {
+      const state = Y.encodeStateAsUpdate(doc);
+
+        await fileSyncQueue.add(
+          "persist-file",
+          {
+            fileId,
+            contentBinary: Buffer.from(state).toString("base64"),
+          },
+          { 
+            jobId: fileId,
+            removeOnComplete: true
+          }
+        );
+      saveTimers.delete(fileId);
+    }, 2000);
+
+    saveTimers.set(fileId, timer);
+      } catch (error) {
+        console.error("[File Update Raw] Update Error: ",error);
+      }
+  
+  })
+
+  socket.on("file:awareness-update", ({ fileId, update }: {
+    fileId: string,
+    update: Uint8Array,
+  }) => {
+    // 1. Live Relay
+    socket.volatile.to(`file:${fileId}`).emit("file:awareness-update", update);
+
+  })
+
+  socket.on("file:leave", ({ fileId }) => {
+
+    if(!socket.data.user) return;
+    const userId = socket.data.user._id;
+
+    const usersInFile = activeFileUsers.get(fileId);
+    if(usersInFile && usersInFile.has(fileId)){
+      const userSession = usersInFile.get(userId)!;
+
+      // Remove this specific socket
+      userSession.sockets.delete(socket.id);
+
+      // If no socket left for this user, remove user from presence
+      if(userSession.sockets.size === 0){
+        usersInFile.delete(userId);
+      }
+
+      // Cleanup empty file rooms
+      if(usersInFile.size === 0){
+        activeFileUsers.delete(fileId);
+      }else{
+        // Broadcast updated list
+        const presenceList = Array.from(usersInFile.values()).map(user => ({
+          userId: user.userId,
+          username: user.username,
+          avatarUrl: user.avatarUrl,
+        }));
+
+        io.to(`file:${fileId}`).emit("file:presence", presenceList);
+      }
+    }
+    socket.leave(`file:${fileId}`);
+   
+  });
+
+
+  // --- TITLE EDITING EVENTS ---
+
+  // 1. User starts editing (double clicking the title)
+  socket.on("presence:remote-editing-start", ({
+    workspaceId,
+    itemId,
+    username,
+    userId
+  }) => {
+      // Broadcast to others in the workspace room
+      socket.to(`workspace:${workspaceId}`).emit("presence:remote-editing-start", {
+        itemId,
+        userId,
+        username
+      });
+
+      // Store when item this specific socket is editing for disconnect cleanup
+      socket.data.editing = { workspaceId, itemId };
+  });
+
+
+  // 2. User is typing (High frequency)
+  socket.on("presence:remote-editing-typing", ({
+    workspaceId,
+    itemId,
+    tempTitle
+  }) => {
+    socket.to(`workspace:${workspaceId}`).emit("presence:remote-editing-typing", {
+      itemId,
+      tempTitle
+    });
+  });
+
+  // 3. User stops editing (Blur, Escape or Save)
+  socket.on("presence:remote-editing-stop", ({ 
+    workspaceId,
+    itemId
+  }) => {
+    socket.to(`workspace:${workspaceId}`).emit("presence:remote-editing-stop", {
+      itemId
+    });
+
+    socket.data.editing = null;
+  });
+  
+});
+
+
+/**
+ * INTERNAL API ENDPOINTS
+ * Allows the Next.js backend to trigger socket events (e.g. tree updates, member changes)
+ */
+app.use(cors({
+  origin: "http://localhost:3000",
+  methods: [ "GET", "POST"],
+  credentials: true,
+}));
+app.use(express.json());
+
+// start the realtime server
+const PORT = 4000;
+
+server.listen(PORT, () => {
+  console.log("🚀 Realtime server running on port", PORT);
+});
+
+app.post("/emit/workspace-members-update",(req,res) => {
+  const { workspaceId, userId, username, action } = req.body;
+
+  if(!workspaceId || !userId || !username){  
+    return res.status(400).json({
+        error: "WorkspaceId and userId are required",
+    });
+  }
+
+  if(!username){
+    return res.status(400).json({
+        error: "Username is required",
+    });
+  }
+
+  const room = `workspace:${workspaceId}`;
+  const clients = io.sockets.adapter.rooms.get(room);
+
+  io.to(`workspace:${workspaceId}`).emit("members:update", {
+    workspaceId,
+    userId,
+    username,
+    action,
+  });
+
+  return res.json({ ok: true })
+})
+
+app.post("/emit/file-update", (req,res) => {
+
+  const { workspaceId, fileId, update, userId } = req.body;
+
+  if(!fileId || !userId){
+    return res.status(400).json({
+        error: "FileId and userId is required",
+    });
+  }
+
+  if(!update){
+    return res.status(400).json({
+        error: "Update is required",
+    });
+  }
+
+  const room = `workspace:${workspaceId}`;
+  const clients = io.sockets.adapter.rooms.get(room);
+  io.to(`file:${fileId}`).emit("file:update", {
+    fileId,
+    update,
+    userId,
+  });
+
+  return res.json({ ok: true })
+})
+
+app.post("/emit/workspace-tree-update", (req,res) => {
+
+  const { workspaceId, type, payload, senderSocketId } = req.body;
+  const room = `workspace:${workspaceId}`;
+const clients = io.sockets.adapter.rooms.get(room);
+const clientCount = clients ? clients.size : 0 ;
+
+  io.to(`workspace:${workspaceId}`).except(senderSocketId).emit("workspace:tree:update", {
+    type,
+    payload,
+  });
+
+  return res.json({ ok: true })
+})
+
+
+app.post("/emit/progress-update", (req, res) => {
+  const {
+    resourceId,
+    workspaceId,
+    progress,
+    currentCount,
+    totalCards,
+  } = req.body;
+
+  // 1. Find the lock in map
+  const state = activeGenerationLocks.get(String(resourceId));
+
+  if(state){
+    // 2. Update the state
+    state.progress = progress;
+    state.currentCount = currentCount;
+    state.totalCards = totalCards;
+    
+    // 3. Broadcast to the workspace room
+    io.to(`workspace:${state.workspaceId}`).emit("gen_status_update", state);
+    return res.json({ ok: true });
+  }
+
+  console.warn(`[Server] Progress Update Error, FAILED: No lock found for ${resourceId}`);
+  res.status(404).json({
+    error: "No active lock found for this resouce."
+  });
+});
+
+app.post("/emit/set-created", (req, res) => {
+  const { workspaceId, resourceId } = req.body;
+
+  io.to(`workpsace:${workspaceId}`).emit("flashcard_set_created", { resourceId });
+  res.json({ ok: true });
+});
+
+app.post("/emit/set-deleted", (req, res) => {
+  const { workspaceId, setId } = req.body;
+
+  io.to(`workspace:${workspaceId}`).emit("flashcard_set_deleted", { setId });
+  res.json({ ok: true });
+})
