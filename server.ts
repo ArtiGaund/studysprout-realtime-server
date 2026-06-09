@@ -17,9 +17,15 @@ import { decode } from "next-auth/jwt";
 import cors from "cors";
 import { ConnectionOptions, Queue } from "bullmq";
 import * as Y from "yjs";
+import { error } from "console";
 
 // creating HTTP server (socket.io attaches to this)
 const app = express();
+// Standard JSON payload (Worker uses)
+app.use(express.json({ limit: '50mb'}));
+// For form-encoded data
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
 const server = http.createServer(app);
 
 /** * REDIS CONFIGURATION
@@ -463,6 +469,7 @@ io.on("connection", (socket) => {
           {
             fileId,
             contentBinary: Buffer.from(state).toString("base64"),
+            userId: socket.data.user?._id,
           },
           { 
             jobId: fileId,
@@ -702,4 +709,24 @@ app.post("/emit/set-deleted", (req, res) => {
 
   io.to(`workspace:${workspaceId}`).emit("flashcard_set_deleted", { setId });
   res.json({ ok: true });
+});
+
+app.post("/api/socket/emit", (req, res) => {
+  const { workspaceId, type, payload } = req.body;
+
+  if(!workspaceId || !type){
+    return res.status(400).json({
+      error: "workspaceId and type is required",
+    });
+  }
+
+  // Target the specific workspace room
+  const room = `workspace:${workspaceId}`;
+
+  io.to(room).emit("workspace:tree:update", {
+    type,
+    payload,
+  });
+
+  return res.json({ ok: true });
 })
