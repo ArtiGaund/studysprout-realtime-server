@@ -126,6 +126,9 @@ const broadcastWorkspaceLocks = (workspaceId: string) => {
 // Runs AFTER socket is connected
 io.on("connection", (socket) => {
 
+    if(socket.data.user?._id){
+      socket.join(`user:${socket.data.user?._id}`);
+    }
     /** *EVENT: Workspace Join
      * Subscribe a user to a specific workspace "room" for presence updates
      */
@@ -575,6 +578,13 @@ io.on("connection", (socket) => {
 
     socket.data.editing = null;
   });
+
+  socket.on("user:rejoin", () => {
+    if(socket.data.user?._id) {
+      socket.join(`user:${socket.data.user?._id}`);
+      console.log(`[socket] user:${socket.data.user._id} rejoined personal room`);
+    }
+  })
   
 });
 
@@ -730,3 +740,78 @@ app.post("/api/socket/emit", (req, res) => {
 
   return res.json({ ok: true });
 })
+
+// Workspace-Invitation
+app.post("/emit/workspace-invitation", (req, res) => {
+  const {
+    recipientId,
+    invitationId,
+    workspaceId,
+    workspaceTitle,
+    invitedByUsername,
+    role,
+    action,
+  } = req.body;
+
+  if(!recipientId || !invitationId || !workspaceId){
+    return res.status(400).json({
+      error: "recipientId, invitationId and workspaceId are required",
+    });
+  }
+
+  // Emit to the invited user's personal room
+  io.to(`user:${recipientId}`).emit("workspace-invitation", {
+    invitationId,
+    workspaceId,
+    workspaceTitle,
+    invitedByUsername,
+    role,
+    action: action ?? "received",
+  });
+
+  return res.json({ ok: true });
+});
+
+app.post("/emit/workspace-invitation-response", (req, res) => {
+  const {
+    recipientId,
+    workspaceId,
+    invitationId,
+    invitedUserId,
+    action,
+  } = req.body;
+
+  if(!recipientId || !workspaceId || !invitationId){
+    return res.status(400).json({
+      error: "recipientId, workspaceId and invitationId is required",
+    });
+  }
+
+  if(action !== "accepted" && action !== "rejected"){
+    return res.status(400).json({
+      error: "action must be accepted or rejected",
+    });
+  }
+
+  io.to(`user:${recipientId}`).emit("workspace-invitation-response", {
+    workspaceId,
+    invitationId,
+    invitedUserId,
+    action,
+  });
+
+  return res.json({ ok: true });
+})
+
+app.post("/emit/notification", (req, res) => {
+  const { recipientId, notification } = req.body;
+
+  if(!recipientId || !notification){
+    return res.status(400).json({
+      error: "recipientId and notification are required",
+    });
+  }
+
+  io.to(`user:${recipientId}`).emit("notification:new", notification);
+  return res.json({ ok: true });
+});
