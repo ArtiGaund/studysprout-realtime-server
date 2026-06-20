@@ -582,7 +582,6 @@ io.on("connection", (socket) => {
   socket.on("user:rejoin", () => {
     if(socket.data.user?._id) {
       socket.join(`user:${socket.data.user?._id}`);
-      console.log(`[socket] user:${socket.data.user._id} rejoined personal room`);
     }
   })
   
@@ -604,11 +603,11 @@ app.use(express.json());
 const PORT = 4000;
 
 server.listen(PORT, () => {
-  console.log("🚀 Realtime server running on port", PORT);
+  console.log("Realtime server running on port", PORT);
 });
 
 app.post("/emit/workspace-members-update",(req,res) => {
-  const { workspaceId, userId, username, action } = req.body;
+  const { workspaceId, userId, username, action, member } = req.body;
 
   if(!workspaceId || !userId || !username){  
     return res.status(400).json({
@@ -630,6 +629,7 @@ app.post("/emit/workspace-members-update",(req,res) => {
     userId,
     username,
     action,
+    member,
   });
 
   return res.json({ ok: true })
@@ -813,5 +813,33 @@ app.post("/emit/notification", (req, res) => {
   }
 
   io.to(`user:${recipientId}`).emit("notification:new", notification);
+  return res.json({ ok: true });
+});
+
+app.post("/emit/workspace-joined", (req, res) => {
+  const { recipientId, workspace } = req.body;
+
+  if(!recipientId || !workspace){
+    return res.status(400).json({
+      error: "recipientId and workspace are required",
+    });
+  }
+
+  // Emit to the accepted user's personal room
+  io.to(`user:${recipientId}`).emit("workspace:joined", { workspace });
+
+  return res.json({ ok: true });
+});
+
+app.post("/emit/workspace-left", (req, res) => {
+  const { recipientId, workspaceId } = req.body;
+
+  if(!recipientId || !workspaceId){
+    return res.status(400).json({
+      error: "recipientId and workspaceId are required",
+    });
+  }
+
+  io.to(`user:${recipientId}`).emit("workspace:left", { workspaceId });
   return res.json({ ok: true });
 });
