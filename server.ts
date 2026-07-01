@@ -19,12 +19,24 @@ import { ConnectionOptions, Queue } from "bullmq";
 import * as Y from "yjs";
 import { error } from "console";
 
-// creating HTTP server (socket.io attaches to this)
+/**
+ * ----HTTP server (socket.io attaches to this)----
+ */
 const app = express();
 // Standard JSON payload (Worker uses)
 app.use(express.json({ limit: '50mb'}));
 // For form-encoded data
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
+/**
+ * INTERNAL API ENDPOINTS
+ * Allows the Next.js backend to trigger socket events (e.g. tree updates, member changes)
+ */
+app.use(cors({
+  origin: process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
+  methods: [ "GET", "POST"],
+  credentials: true,
+}));
+app.use(express.json());
 
 const server = http.createServer(app);
 
@@ -33,7 +45,7 @@ const server = http.createServer(app);
  */ 
 const redisConnection: ConnectionOptions = {
   host: process.env.REDIS_HOST || "localhost",
-  port: parseInt(process.env.REDIS_POST || "6379"),
+  port: parseInt(process.env.REDIS_PORT || "6379"),
   maxRetriesPerRequest: null, //Required for BullMQ
 }
 
@@ -48,24 +60,57 @@ const saveTimers = new Map<string, NodeJS.Timeout>();
 const fileSyncQueue = new Queue("file-sync-queue", { 
   connection: redisConnection 
 });
-// Initialize socket.io
+
+/**
+ * ---- Initialize socket.io ----
+ */
 const io = new Server(server, {
     cors: { origin: "*"}, //allow frontend connections 
 })
 
-/** *WORKSPACE PRESENCE TRACKING
+// --- Presence Maps ----
+/** Workspace Presence
  * workspaceId -> userId -> Set of socketIds
  * Using a Set for sockets allows a single user to have multiple tabs open without flickering
  */ 
 const workspacePresence = new Map<
-    string,  //workspaceId
-    Map<
+  string,  //workspaceId
+  Map<
     string, //userId
     Set<string> //socketIds
-    >
-  >();
+  >
+>();
 
-/** *SOCKET AUTHENTICATION MIDDLEWARE 
+  /** File Presence
+ * fileId -> userId -> user data (for avatar/cursor presence)
+ */
+const activeFileUsers = new Map<
+  string, //fileId
+  Map<string, {
+    userId: string;
+    username: string;
+    avatarUrl?: string;
+    sockets: Set<string>;   //for multi-tab support
+  }> 
+>();
+
+/** AI GENERATION LOCKS
+ * resourceId -> State object
+ * Prevents multiple users from calling the GEMINI API for the same file at the same time
+ */
+const activeGenerationLocks = new Map();
+
+/** *Helper: 
+ * Broadcasts all current locks of a workspace to keep progress bars in sync for everyone
+ */
+const broadcastWorkspaceLocks = (workspaceId: string) => {
+  const locks = Array.from(activeGenerationLocks.values())
+  .filter((lock: any) => String(lock.workspaceId) === String(workspaceId));
+
+  io.to(`workspace:${workspaceId}`).emit("workspace_locks_update", locks);
+}
+
+/** SOCKET AUTHENTICATION MIDDLEWARE 
  * Decodes the NextAuth JWT to verify identify before allowing a connection
  */
 io.use(async (socket, next) => {
@@ -95,40 +140,17 @@ io.use(async (socket, next) => {
       return  next();
     }
 })
-/** *FILE PRESENCE TRACKING
- * fileId -> userId -> user data (for avatar/cursor presence)
- */
-const activeFileUsers = new Map<
-string, //fileId
-Map<string, {
-  userId: string;
-  username: string;
-  avatarUrl?: string;
-  sockets: Set<string>;   //for multi-tab support
-}> 
->();
 
-/** *AI GENERATION LOCKS
- * resourceId -> State object
- * Prevents multiple users from calling the GEMINI API for the same file at the same time
+/**
+ * Socket Connection Handler (Events)
  */
-const activeGenerationLocks = new Map();
-
-/** *Helper: Broadcasts all current locks of a workspace to keep progress bars in sync for everyone
- * 
- */
-const broadcastWorkspaceLocks = (workspaceId: string) => {
-  const locks = Array.from(activeGenerationLocks.values())
-  .filter((lock: any) => String(lock.workspaceId) === String(workspaceId));
-
-  io.to(`workspace:${workspaceId}`).emit("workspace_locks_update", locks);
-}
-// Runs AFTER socket is connected
 io.on("connection", (socket) => {
 
+    // Join personal room for direct user notifications
     if(socket.data.user?._id){
       socket.join(`user:${socket.data.user?._id}`);
     }
+
     /** *EVENT: Workspace Join
      * Subscribe a user to a specific workspace "room" for presence updates
      */
@@ -146,7 +168,6 @@ io.on("connection", (socket) => {
       }
 
       const userId = socket.data.user._id;
-
       socket.data.currentWorkspaceId = workspaceId;
 
       // Initialize workspace map
@@ -155,16 +176,13 @@ io.on("connection", (socket) => {
       }
 
       const usersMap = workspacePresence.get(workspaceId)!;
-
       const sockets = usersMap.get(userId);
-      if(sockets && sockets.has(socket.id)){
-        if(typeof ack === "function"){
-          ack({ ok: true });
-        }
 
+      //Already joined on this socket - idempotent 
+      if(sockets && sockets.has(socket.id)){
+        if(typeof ack === "function") ack({ ok: true });
         return;
       }
-
 
       // Initialize user socket set
       if(!usersMap.has(userId)){
@@ -172,11 +190,9 @@ io.on("connection", (socket) => {
       }
 
       usersMap.get(userId)!.add(socket.id);
-
       // Join workspace-specific room
       socket.join(`workspace:${workspaceId}`);
 
-    
       io.to(`workspace:${workspaceId}`).emit("presence:update",{
         workspaceId,
         users: Array.from(usersMap.keys()),
@@ -186,7 +202,6 @@ io.on("connection", (socket) => {
         ack({ ok: true });
       }
     });
-
     
     socket.on("workspace:leave", ({ workspaceId }) => {
       socket.leave(`workspace:${workspaceId}`);
@@ -248,6 +263,13 @@ io.on("connection", (socket) => {
 
       socket.emit("lock_granted", { rId });
 
+      io.to(`workspace:${wId}`).emit("gen_status_update", {
+          resourceId: genState.resourceId,
+          workspaceId: genState.workspaceId,
+          progress: genState.progress,
+          currentCount: genState.currentCount,
+          totalCards: genState.totalCards,
+      });
       // Notify everyone in the workspace about the new process
       // io.to(`workspace:${wId}`).emit("gen_status_update", genState);
       broadcastWorkspaceLocks(wId);
@@ -277,6 +299,15 @@ io.on("connection", (socket) => {
         state.progress = progress;
         state.currentCount = currentCount;
         state.totalCards = totalCards;
+
+        io.to(`workspace:${workspaceId}`).emit("gen_status_update", {
+          resourceId,
+          workspaceId,
+          progress,
+          currentCount,
+          totalCards,
+        });
+        
         broadcastWorkspaceLocks(workspaceId);
       }
     });
@@ -301,6 +332,213 @@ io.on("connection", (socket) => {
       .filter((lock: any) => String(lock.workspaceId) === String(workspaceId));
       socket.emit("workspace_locks_update", activeLocks);
     });
+
+  // --- TITLE EDITING EVENTS ---
+
+  // 1. User starts editing (double clicking the title)
+    socket.on("presence:remote-editing-start", ({
+      workspaceId,
+      itemId,
+      username,
+      userId
+    }) => {
+      // Broadcast to others in the workspace room
+      socket.to(`workspace:${workspaceId}`).emit("presence:remote-editing-start", {
+        itemId,
+        userId,
+        username
+      });
+
+      // Store when item this specific socket is editing for disconnect cleanup
+      socket.data.editing = { workspaceId, itemId };
+    });
+
+
+    // 2. User is typing (High frequency)
+    socket.on("presence:remote-editing-typing", ({
+      workspaceId,
+      itemId,
+      tempTitle
+    }) => {
+      socket.to(`workspace:${workspaceId}`).emit("presence:remote-editing-typing", {
+        itemId,
+        tempTitle
+      });
+    });
+
+    // 3. User stops editing (Blur, Escape or Save)
+    socket.on("presence:remote-editing-stop", ({ 
+      workspaceId,
+      itemId
+    }) => {
+      socket.to(`workspace:${workspaceId}`).emit("presence:remote-editing-stop", {
+        itemId
+      });
+
+      socket.data.editing = null;
+    });
+
+    /** *EVENT: File Join
+     * Subscribe a user to a specific file "room" for presence updates
+     */
+    socket.on("file:join", ({ fileId }) => {
+      // 1. Validation
+      if(!socket.data.user || !fileId) return;
+
+      const { _id:userId , username, avatarUrl } = socket.data.user;
+
+      socket.data.currentFileId = fileId;
+
+      //2. Join the Socket.io Room
+      const roomName = `file:${fileId}`;
+      socket.join(roomName);
+
+      //3. Ensure the file room exists
+      if(!activeFileUsers.has(fileId)){
+        activeFileUsers.set(fileId, new Map());
+      }
+
+      const usersInFile = activeFileUsers.get(fileId);
+
+      if(!usersInFile) return;
+
+      // 4.Add or update user entry
+      if(!usersInFile.has(userId)){
+        usersInFile.set(userId, {
+          userId,
+          username,
+          avatarUrl,
+          sockets: new Set([socket.id]),
+        });
+      }else{
+        // User is already here in another tab, just add this socket
+        usersInFile.get(userId)!.sockets.add(socket.id);
+      }
+
+      // 5. Broadcast the current list 
+      const presenceList = Array.from(usersInFile?.values()).map(user => ({
+        userId: user.userId,
+        username: user.username,
+        avatarUrl: user.avatarUrl
+      }));
+
+      // Broadcast the array of user objects to everyone in the file
+      io.to(`file:${fileId}`).emit("file:presence",
+        presenceList
+      );
+
+      const doc = docs.get(fileId);
+      if(doc){
+        const state = Y.encodeStateAsUpdate(doc);
+        socket.emit("file:update-raw", state);
+      }else{
+        const newDoc = new Y.Doc();
+        newDoc.getXmlFragment("document-content");
+        docs.set(fileId, newDoc);
+      }
+    });
+
+    
+  /** *YJS LIVE EDITING HANDLES
+   * Relay updates between users for shared document editing
+   */
+  socket.on("file:update-raw", ({ fileId, update }: {
+    fileId: string,
+    update: Uint8Array
+  }) => {
+    // 1. Live Relay 
+    socket.to(`file:${fileId}`).emit("file:update-raw", update);
+
+    // 2. Update the Server's "Mirror" Doc
+    // Sync server-side mirror and debounce database save
+    if(!docs.has(fileId)){
+      const newDoc = new Y.Doc();
+      newDoc.getXmlFragment("document-content");
+      docs.set(fileId, newDoc);
+    }
+    const doc = docs.get(fileId);
+    if(!doc) return;
+      try {
+        Y.applyUpdate(doc, new Uint8Array(update));
+        // 3. Debounce the Save job
+    // Wait for 2 sec of silence before asking the Worker to save to DB
+    clearTimeout(saveTimers.get(fileId));
+
+    const timer = setTimeout(async() => {
+      const state = Y.encodeStateAsUpdate(doc);
+
+        await fileSyncQueue.add(
+          "persist-file",
+          {
+            fileId,
+            contentBinary: Buffer.from(state).toString("base64"),
+            userId: socket.data.user?._id,
+          },
+          { 
+            jobId: fileId,
+            removeOnComplete: true
+          }
+        );
+      saveTimers.delete(fileId);
+    }, 2000);
+
+    saveTimers.set(fileId, timer);
+      } catch (error) {
+        console.error("[File Update Raw] Update Error: ",error);
+      }
+  
+  })
+
+  socket.on("file:awareness-update", ({ fileId, update }: {
+    fileId: string,
+    update: Uint8Array,
+  }) => {
+    // 1. Live Relay
+    socket.volatile.to(`file:${fileId}`).emit("file:awareness-update", update);
+
+  })
+
+  socket.on("file:leave", ({ fileId }) => {
+
+    if(!socket.data.user) return;
+    const userId = socket.data.user._id;
+
+    const usersInFile = activeFileUsers.get(fileId);
+    if(usersInFile && usersInFile.has(userId)){
+      const userSession = usersInFile.get(userId)!;
+
+      // Remove this specific socket
+      userSession.sockets.delete(socket.id);
+
+      // If no socket left for this user, remove user from presence
+      if(userSession.sockets.size === 0){
+        usersInFile.delete(userId);
+      }
+
+      // Cleanup empty file rooms
+      if(usersInFile.size === 0){
+        activeFileUsers.delete(fileId);
+      }else{
+        // Broadcast updated list
+        const presenceList = Array.from(usersInFile.values()).map(user => ({
+          userId: user.userId,
+          username: user.username,
+          avatarUrl: user.avatarUrl,
+        }));
+
+        io.to(`file:${fileId}`).emit("file:presence", presenceList);
+      }
+    }
+    socket.leave(`file:${fileId}`);
+   
+  });
+
+  /** Misc */
+  socket.on("user:rejoin", () => {
+    if(socket.data.user?._id) {
+      socket.join(`user:${socket.data.user?._id}`);
+    }
+  });
 
    /** *CLEANUP: Handles disconnections
     *   Removes user from presence maps and releases any active AI locks held by this socket
@@ -377,235 +615,26 @@ io.on("connection", (socket) => {
     }
 
   });
-
-  
-  /** *EVENT: File Join
-     * Subscribe a user to a specific file "room" for presence updates
-     */
-  socket.on("file:join", ({ fileId }) => {
-    // 1. Validation
-    if(!socket.data.user || !fileId) return;
-
-    const { _id:userId , username, avatarUrl } = socket.data.user;
-
-    socket.data.currentFileId = fileId;
-
-    //2. Join the Socket.io Room
-    const roomName = `file:${fileId}`;
-    socket.join(roomName);
-
-    //3. Ensure the file room exists
-    if(!activeFileUsers.has(fileId)){
-      activeFileUsers.set(fileId, new Map());
-    }
-
-    const usersInFile = activeFileUsers.get(fileId);
-
-    if(!usersInFile) return;
-
-    // 4.Add or update user entry
-    if(!usersInFile.has(userId)){
-      usersInFile.set(userId, {
-        userId,
-        username,
-        avatarUrl,
-        sockets: new Set([socket.id]),
-      });
-    }else{
-      // User is already here in another tab, just add this socket
-      usersInFile.get(userId)!.sockets.add(socket.id);
-    }
-
-    // 5. Broadcast the current list 
-    const presenceList = Array.from(usersInFile?.values()).map(user => ({
-      userId: user.userId,
-      username: user.username,
-      avatarUrl: user.avatarUrl
-    }));
-
-    // Broadcast the array of user objects to everyone in the file
-    io.to(`file:${fileId}`).emit("file:presence",
-      presenceList
-    );
-
-    const doc = docs.get(fileId);
-    if(doc){
-      const state = Y.encodeStateAsUpdate(doc);
-      socket.emit("file:update-raw", state);
-    }else{
-      const newDoc = new Y.Doc();
-      newDoc.getXmlFragment("document-content");
-      docs.set(fileId, newDoc);
-    }
-  });
-
-  /** *YJS LIVE EDITING HANDLES
-   * Relay updates between users for shared document editing
-   */
-  socket.on("file:update-raw", ({ fileId, update }: {
-    fileId: string,
-    update: Uint8Array
-  }) => {
-    // 1. Live Relay 
-    socket.to(`file:${fileId}`).emit("file:update-raw", update);
-
-    // 2. Update the Server's "Mirror" Doc
-    // Sync server-side mirror and debounce database save
-    if(!docs.has(fileId)){
-      const newDoc = new Y.Doc();
-      newDoc.getXmlFragment("document-content");
-      docs.set(fileId, newDoc);
-    }
-    const doc = docs.get(fileId);
-    if(!doc) return;
-      try {
-        Y.applyUpdate(doc, new Uint8Array(update));
-        // 3. Debounce the Save job
-    // Wait for 2 sec of silence before asking the Worker to save to DB
-    clearTimeout(saveTimers.get(fileId));
-
-    const timer = setTimeout(async() => {
-      const state = Y.encodeStateAsUpdate(doc);
-
-        await fileSyncQueue.add(
-          "persist-file",
-          {
-            fileId,
-            contentBinary: Buffer.from(state).toString("base64"),
-            userId: socket.data.user?._id,
-          },
-          { 
-            jobId: fileId,
-            removeOnComplete: true
-          }
-        );
-      saveTimers.delete(fileId);
-    }, 2000);
-
-    saveTimers.set(fileId, timer);
-      } catch (error) {
-        console.error("[File Update Raw] Update Error: ",error);
-      }
-  
-  })
-
-  socket.on("file:awareness-update", ({ fileId, update }: {
-    fileId: string,
-    update: Uint8Array,
-  }) => {
-    // 1. Live Relay
-    socket.volatile.to(`file:${fileId}`).emit("file:awareness-update", update);
-
-  })
-
-  socket.on("file:leave", ({ fileId }) => {
-
-    if(!socket.data.user) return;
-    const userId = socket.data.user._id;
-
-    const usersInFile = activeFileUsers.get(fileId);
-    if(usersInFile && usersInFile.has(fileId)){
-      const userSession = usersInFile.get(userId)!;
-
-      // Remove this specific socket
-      userSession.sockets.delete(socket.id);
-
-      // If no socket left for this user, remove user from presence
-      if(userSession.sockets.size === 0){
-        usersInFile.delete(userId);
-      }
-
-      // Cleanup empty file rooms
-      if(usersInFile.size === 0){
-        activeFileUsers.delete(fileId);
-      }else{
-        // Broadcast updated list
-        const presenceList = Array.from(usersInFile.values()).map(user => ({
-          userId: user.userId,
-          username: user.username,
-          avatarUrl: user.avatarUrl,
-        }));
-
-        io.to(`file:${fileId}`).emit("file:presence", presenceList);
-      }
-    }
-    socket.leave(`file:${fileId}`);
-   
-  });
-
-
-  // --- TITLE EDITING EVENTS ---
-
-  // 1. User starts editing (double clicking the title)
-  socket.on("presence:remote-editing-start", ({
-    workspaceId,
-    itemId,
-    username,
-    userId
-  }) => {
-      // Broadcast to others in the workspace room
-      socket.to(`workspace:${workspaceId}`).emit("presence:remote-editing-start", {
-        itemId,
-        userId,
-        username
-      });
-
-      // Store when item this specific socket is editing for disconnect cleanup
-      socket.data.editing = { workspaceId, itemId };
-  });
-
-
-  // 2. User is typing (High frequency)
-  socket.on("presence:remote-editing-typing", ({
-    workspaceId,
-    itemId,
-    tempTitle
-  }) => {
-    socket.to(`workspace:${workspaceId}`).emit("presence:remote-editing-typing", {
-      itemId,
-      tempTitle
-    });
-  });
-
-  // 3. User stops editing (Blur, Escape or Save)
-  socket.on("presence:remote-editing-stop", ({ 
-    workspaceId,
-    itemId
-  }) => {
-    socket.to(`workspace:${workspaceId}`).emit("presence:remote-editing-stop", {
-      itemId
-    });
-
-    socket.data.editing = null;
-  });
-
-  socket.on("user:rejoin", () => {
-    if(socket.data.user?._id) {
-      socket.join(`user:${socket.data.user?._id}`);
-    }
-  })
-  
 });
 
 
-/**
- * INTERNAL API ENDPOINTS
- * Allows the Next.js backend to trigger socket events (e.g. tree updates, member changes)
- */
-app.use(cors({
-  origin: "http://localhost:3000",
-  methods: [ "GET", "POST"],
-  credentials: true,
-}));
-app.use(express.json());
+/** Workspace tree change (folder/file CRUD) */
+app.post("/emit/workspace-tree-update", (req,res) => {
 
-// start the realtime server
-const PORT = 4000;
+  const { workspaceId, type, payload, senderSocketId } = req.body;
+  const room = `workspace:${workspaceId}`;
+  const clients = io.sockets.adapter.rooms.get(room);
+  const clientCount = clients ? clients.size : 0 ;
 
-server.listen(PORT, () => {
-  console.log("Realtime server running on port", PORT);
+  io.to(`workspace:${workspaceId}`).except(senderSocketId).emit("workspace:tree:update", {
+    type,
+    payload,
+  });
+
+  return res.json({ ok: true })
 });
 
+/** Workspace member added/removed */
 app.post("/emit/workspace-members-update",(req,res) => {
   const { workspaceId, userId, username, action, member } = req.body;
 
@@ -635,6 +664,8 @@ app.post("/emit/workspace-members-update",(req,res) => {
   return res.json({ ok: true })
 })
 
+
+/** Yjs binary update from a worker (PDF import, etc.) */
 app.post("/emit/file-update", (req,res) => {
 
   const { workspaceId, fileId, update, userId } = req.body;
@@ -662,22 +693,7 @@ app.post("/emit/file-update", (req,res) => {
   return res.json({ ok: true })
 })
 
-app.post("/emit/workspace-tree-update", (req,res) => {
-
-  const { workspaceId, type, payload, senderSocketId } = req.body;
-  const room = `workspace:${workspaceId}`;
-const clients = io.sockets.adapter.rooms.get(room);
-const clientCount = clients ? clients.size : 0 ;
-
-  io.to(`workspace:${workspaceId}`).except(senderSocketId).emit("workspace:tree:update", {
-    type,
-    payload,
-  });
-
-  return res.json({ ok: true })
-})
-
-
+/** AI generation progress  */
 app.post("/emit/progress-update", (req, res) => {
   const {
     resourceId,
@@ -707,13 +723,15 @@ app.post("/emit/progress-update", (req, res) => {
   });
 });
 
+/** Flashcard set created (new set, new cards) */
 app.post("/emit/set-created", (req, res) => {
   const { workspaceId, resourceId } = req.body;
 
-  io.to(`workpsace:${workspaceId}`).emit("flashcard_set_created", { resourceId });
+  io.to(`workspace:${workspaceId}`).emit("flashcard_set_created", { resourceId });
   res.json({ ok: true });
 });
 
+/** Flashcard set deleted */
 app.post("/emit/set-deleted", (req, res) => {
   const { workspaceId, setId } = req.body;
 
@@ -721,27 +739,118 @@ app.post("/emit/set-deleted", (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/api/socket/emit", (req, res) => {
-  const { workspaceId, type, payload } = req.body;
-
-  if(!workspaceId || !type){
+/** Flashcard set title updated */
+app.post("/emit/set-updated", (req, res) => {
+  const { workspaceId, setId, updates } = req.body;
+  if(!workspaceId || !setId){
     return res.status(400).json({
-      error: "workspaceId and type is required",
+      error: "workspaceId and setId is required",
     });
   }
 
-  // Target the specific workspace room
-  const room = `workspace:${workspaceId}`;
-
-  io.to(room).emit("workspace:tree:update", {
-    type,
-    payload,
+  io.to(`workspace:${workspaceId}`).emit("workspace:tree:update", {
+    type: "flashcard_set_updated",
+    payload: { setId, updates },
   });
 
   return res.json({ ok: true });
-})
+});
 
-// Workspace-Invitation
+/** Full flashcard set regenerated (same set, cards replaced) */
+app.post("/emit/set-regenerated", (req, res) => {
+  const { workspaceId, setId, resourceId } = req.body;
+
+  if(!workspaceId || !setId){
+    return res.status(400).json({
+      error: "workspaceId and setId is required",
+    });
+  }
+
+  io.to(`workspace:${workspaceId}`).emit("workspace:tree:update", {
+    type: "flashcard_set_regenerated",
+    payload: { setId, resourceId },
+  });
+
+  return res.json({ ok: true });
+});
+
+/** Single card within a set regenerated */
+app.post("/emit/card-regenerated", (req, res) => {
+  const { workspaceId, setId, cardId } = req.body;
+
+  if(!workspaceId || !setId || !cardId){
+    return res.status(400).json({
+      error: "workspaceId, setId and cardId is required",
+    });
+  }
+
+  io.to(`workspace:${workspaceId}`).emit("workspace:tree:update", {
+    type: "flashcard_card_regenerated",
+    payload: { setId, cardId },
+  });
+
+  return res.json({ ok: true });
+});
+
+/**  Flashcard set marked outdated (file content changed)*/
+app.post("/emit/set-outdated", (req, res) => {
+  const { workspaceId, resourceId } = req.body;
+  if(!workspaceId || !resourceId) {
+    return res.status(400).json({
+      error: "workspaceId and resourceId required",
+    });
+  }
+
+  io.to(`workspace:${workspaceId}`).emit("workspace:tree:update", {
+    type: "flashcard_set_outdated",
+    payload: { resourceId },
+  });
+  return res.json({ ok: true });
+});
+
+/** Reading time updated after file sync */
+app.post("/emit/file-stats-updated", (req, res) => {
+  const { workspaceId, folderId, fileId, readingTimeMinutes } = req.body;
+  if(!workspaceId || !fileId){
+    return res.status(400).json({
+      error: "workspaceId and fileId required",
+    });
+  }
+
+  io.to(`workspace:${workspaceId}`).emit("workspace:tree:update", {
+    type: "file_stats_updated",
+    payload: {
+      folderId,
+      fileId,
+      readingTimeMinutes,
+    }
+  });
+  return res.json({ ok: true });
+});
+
+/** Activity created (new Recent Activity card) */
+app.post("/emit/activity-created", (req, res) => {
+  const { workspaceId, events } = req.body;
+  if(!workspaceId) {
+    return res.status(400).json({
+      error: "workspaceId required",
+    });
+  }
+
+  if(!events){
+    return res.status(400).json({
+      error: "events required",
+    });
+  }
+
+  io.to(`workspace:${workspaceId}`).emit("workspace:tree:update", {
+    type: "activity_created",
+    payload: { events },
+  });
+  return res.json({ ok: true });
+});
+
+/** Workspace-Invitation */
 app.post("/emit/workspace-invitation", (req, res) => {
   const {
     recipientId,
@@ -772,6 +881,7 @@ app.post("/emit/workspace-invitation", (req, res) => {
   return res.json({ ok: true });
 });
 
+/** Invitation response (accepted/rejected) sent back to inviter */
 app.post("/emit/workspace-invitation-response", (req, res) => {
   const {
     recipientId,
@@ -801,8 +911,9 @@ app.post("/emit/workspace-invitation-response", (req, res) => {
   });
 
   return res.json({ ok: true });
-})
+});
 
+/** General notification to a specific user */
 app.post("/emit/notification", (req, res) => {
   const { recipientId, notification } = req.body;
 
@@ -816,6 +927,7 @@ app.post("/emit/notification", (req, res) => {
   return res.json({ ok: true });
 });
 
+/** User joined a workspace (after accepting invitation) */
 app.post("/emit/workspace-joined", (req, res) => {
   const { recipientId, workspace } = req.body;
 
@@ -831,6 +943,7 @@ app.post("/emit/workspace-joined", (req, res) => {
   return res.json({ ok: true });
 });
 
+/** User left a workspace */
 app.post("/emit/workspace-left", (req, res) => {
   const { recipientId, workspaceId } = req.body;
 
@@ -842,4 +955,41 @@ app.post("/emit/workspace-left", (req, res) => {
 
   io.to(`user:${recipientId}`).emit("workspace:left", { workspaceId });
   return res.json({ ok: true });
+});
+
+app.post("/emit/usage-updated", (req, res) => {
+  const { workspaceId } = req.body;
+  io.to(`workspace:${workspaceId}`).emit("workspace:tree:update", {
+    type: "usage_updated",
+    payload: { workspaceId },
+  });
+
+  return res.json({ ok: true });
+});
+
+/**Generic emit fallback (legacy - prefer specific endpoints above) */
+app.post("/api/socket/emit", (req, res) => {
+  const { workspaceId, type, payload } = req.body;
+
+  if(!workspaceId || !type){
+    return res.status(400).json({
+      error: "workspaceId and type is required",
+    });
+  }
+
+  // Target the specific workspace room
+  const room = `workspace:${workspaceId}`;
+
+  io.to(room).emit("workspace:tree:update", {
+    type,
+    payload,
+  });
+
+  return res.json({ ok: true });
+});
+
+/** Start the realtime server */
+const PORT = 4000;
+server.listen(PORT, () => {
+  console.log("Realtime server running on port", PORT);
 });
