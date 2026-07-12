@@ -40,13 +40,16 @@ app.use(express.json());
 
 const server = http.createServer(app);
 
+const redisUrl = new URL(process.env.REDIS_URL || "redis://localhost:6379");
 /** * REDIS CONFIGURATION
  * BullMQ requires Redis to manage background jobs like persisting Yjs docs to the main DB
  */ 
 const redisConnection: ConnectionOptions = {
-  host: process.env.REDIS_HOST || "localhost",
-  port: parseInt(process.env.REDIS_PORT || "6379"),
-  maxRetriesPerRequest: null, //Required for BullMQ
+  host: redisUrl.hostname,
+  port: parseInt(redisUrl.port || "6379"),
+  password: redisUrl.password || undefined,
+  tls: redisUrl.protocol === "rediss:" ? {} : undefined, // Upstash needs this
+  maxRetriesPerRequest: null,
 }
 
 /** *IN_MEMORY STATE
