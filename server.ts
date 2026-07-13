@@ -44,7 +44,7 @@ const redisUrl = new URL(process.env.REDIS_URL || "redis://localhost:6379");
 /** * REDIS CONFIGURATION
  * BullMQ requires Redis to manage background jobs like persisting Yjs docs to the main DB
  */ 
-const redisConnection: ConnectionOptions = {
+const redisConnection: RedisOptions = {
   host: redisUrl.hostname,
   port: parseInt(redisUrl.port || "6379"),
   password: redisUrl.password || undefined,
@@ -55,6 +55,16 @@ const redisConnection: ConnectionOptions = {
     return Math.min(times * 200, 5000);
   },
 }
+const redisClient = new Redis(redisConnection);
+
+redisClient.on('error', (err) => {
+  console.error("[redis] connection error (auto-reconnecting): ",err.message);
+});
+
+// Keep the connection warm so Upstash doesn't idle-close it
+setInterval(() => {
+  redisClient.ping().catch(() => {});
+}, 20000);
 
 /** *IN_MEMORY STATE
  * docs: Current Yjs document for live editing
@@ -65,7 +75,7 @@ const saveTimers = new Map<string, NodeJS.Timeout>();
 
 // Queue for pushing file updates back to the Next.js main database
 const fileSyncQueue = new Queue("file-sync-queue", { 
-  connection: redisConnection 
+  connection: redisClient as any
 });
 
 /**
