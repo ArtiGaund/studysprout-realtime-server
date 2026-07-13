@@ -70,7 +70,7 @@ const fileSyncQueue = new Queue("file-sync-queue", {
 const io = new Server(server, {
     cors: { 
       origin: [
-        "https://studysprouts.vercel.app",
+        "https://studysprouts.vercel.app/",
         "http://localhost:3000"
       ],
       credentials: true,
