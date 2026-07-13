@@ -17,7 +17,6 @@ import { decode } from "next-auth/jwt";
 import cors from "cors";
 import { ConnectionOptions, Queue } from "bullmq";
 import * as Y from "yjs";
-import { error } from "console";
 
 /**
  * ----HTTP server (socket.io attaches to this)----
@@ -50,6 +49,10 @@ const redisConnection: ConnectionOptions = {
   password: redisUrl.password || undefined,
   tls: redisUrl.protocol === "rediss:" ? {} : undefined, // Upstash needs this
   maxRetriesPerRequest: null,
+  keepAlive: 10000, //send keepalive every 10s
+  retryStrategy(times: number){
+    return Math.min(times * 200, 5000);
+  },
 }
 
 /** *IN_MEMORY STATE
