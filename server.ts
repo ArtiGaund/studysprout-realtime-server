@@ -145,6 +145,7 @@ io.use(async (socket, next) => {
         return next();
     } catch (error) {
       // On decode failure, allow connection but unauthenticated
+      console.error("[socket auth] decode failed:", error);
       socket.data.user = null;
       return  next();
     }
