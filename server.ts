@@ -17,6 +17,7 @@ import { decode } from "next-auth/jwt";
 import cors from "cors";
 import { ConnectionOptions, Queue } from "bullmq";
 import * as Y from "yjs";
+import Redis, { RedisOptions } from "ioredis";
 
 /**
  * ----HTTP server (socket.io attaches to this)----
