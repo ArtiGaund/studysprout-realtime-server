@@ -68,7 +68,13 @@ const fileSyncQueue = new Queue("file-sync-queue", {
  * ---- Initialize socket.io ----
  */
 const io = new Server(server, {
-    cors: { origin: "*"}, //allow frontend connections 
+    cors: { 
+      origin: [
+        "https://studysprouts.vercel.app",
+        "http://localhost:3000"
+      ],
+      credentials: true,
+    }, //allow frontend connections 
 })
 
 // --- Presence Maps ----
