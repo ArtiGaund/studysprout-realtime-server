@@ -461,9 +461,10 @@ io.on("connection", (socket) => {
             const res = await fetch(`${process.env.NEXT_PUBLIC_APP_URL}/api/file/${fileId}`);
             const json = await res.json();
             const contentBinary = json?.data?.contentBinary;
-
+            console.log(`[file:join] NEXT_PUBLIC_APP_URL: ${process.env.NEXT_PUBLIC_APP_URL}`)
             if(contentBinary?.data?.length){
               const bytes = new Uint8Array(contentBinary.data);
+              console.log(`[file:join] bytes: ${bytes}`);
               Y.applyUpdate(newDoc, bytes);
               console.log(`[file:join] hydrated Y.Doc for ${fileId} from DB`);
             }
