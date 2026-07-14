@@ -412,8 +412,7 @@ io.on("connection", (socket) => {
       const { _id:userId , username, avatarUrl } = socket.data.user;
 
       socket.data.currentFileId = fileId;
-      console.log("[file:join] user:", socket.data.user?._id, "fileId:", fileId);
-
+     
       //2. Join the Socket.io Room
       const roomName = `file:${fileId}`;
       socket.join(roomName);
@@ -461,12 +460,9 @@ io.on("connection", (socket) => {
             const res = await fetch(`${process.env.NEXT_PUBLIC_APP_URL}/api/file/${fileId}`);
             const json = await res.json();
             const contentBinary = json?.data?.contentBinary;
-            console.log(`[file:join] NEXT_PUBLIC_APP_URL: ${process.env.NEXT_PUBLIC_APP_URL}`)
             if(contentBinary?.data?.length){
               const bytes = new Uint8Array(contentBinary.data);
-              console.log(`[file:join] bytes: ${bytes}`);
               Y.applyUpdate(newDoc, bytes);
-              console.log(`[file:join] hydrated Y.Doc for ${fileId} from DB`);
             }
         } catch (error) {
           console.error(`[file:join] Failed to hydrate ${fileId} from DB: `,error);
@@ -474,14 +470,8 @@ io.on("connection", (socket) => {
         docs.set(fileId, newDoc);
       }
       const doc = docs.get(fileId)!;
-      // if(doc){
-        const state = Y.encodeStateAsUpdate(doc);
-        socket.emit("file:update-raw", state);
-      // }else{
-      //   const newDoc = new Y.Doc();
-      //   newDoc.getXmlFragment("document-content");
-      //   docs.set(fileId, newDoc);
-      // }
+      const state = Y.encodeStateAsUpdate(doc);
+      socket.emit("file:update-raw", state);
     });
 
     
@@ -492,7 +482,6 @@ io.on("connection", (socket) => {
     fileId: string,
     update: Uint8Array
   }) => {
-    console.log("[file:update-raw] relaying for fileId:", fileId, "to room, update size:", update?.length);
     // 1. Live Relay 
     socket.to(`file:${fileId}`).emit("file:update-raw", update);
 
@@ -513,7 +502,6 @@ io.on("connection", (socket) => {
 
     const timer = setTimeout(async() => {
       const state = Y.encodeStateAsUpdate(doc);
-        console.log("[FileSyncWorker Trigger] queuing persist-file for", fileId);
         await fileSyncQueue.add(
           "persist-file",
           {
