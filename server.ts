@@ -492,7 +492,7 @@ io.on("connection", (socket) => {
 
     const timer = setTimeout(async() => {
       const state = Y.encodeStateAsUpdate(doc);
-
+        console.log("[FileSyncWorker Trigger] queuing persist-file for", fileId);
         await fileSyncQueue.add(
           "persist-file",
           {
