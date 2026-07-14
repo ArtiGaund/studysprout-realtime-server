@@ -412,6 +412,7 @@ io.on("connection", (socket) => {
       const { _id:userId , username, avatarUrl } = socket.data.user;
 
       socket.data.currentFileId = fileId;
+      console.log("[file:join] user:", socket.data.user?._id, "fileId:", fileId);
 
       //2. Join the Socket.io Room
       const roomName = `file:${fileId}`;
@@ -470,6 +471,7 @@ io.on("connection", (socket) => {
     fileId: string,
     update: Uint8Array
   }) => {
+    console.log("[file:update-raw] relaying for fileId:", fileId, "to room, update size:", update?.length);
     // 1. Live Relay 
     socket.to(`file:${fileId}`).emit("file:update-raw", update);
 
