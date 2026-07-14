@@ -405,7 +405,7 @@ io.on("connection", (socket) => {
     /** *EVENT: File Join
      * Subscribe a user to a specific file "room" for presence updates
      */
-    socket.on("file:join", ({ fileId }) => {
+    socket.on("file:join", async ({ fileId }) => {
       // 1. Validation
       if(!socket.data.user || !fileId) return;
 
@@ -452,15 +452,35 @@ io.on("connection", (socket) => {
         presenceList
       );
 
-      const doc = docs.get(fileId);
-      if(doc){
-        const state = Y.encodeStateAsUpdate(doc);
-        socket.emit("file:update-raw", state);
-      }else{
+      // --- Hydration, now DB-backed instead of blank---
+      if(!docs.has(fileId)){
         const newDoc = new Y.Doc();
         newDoc.getXmlFragment("document-content");
+
+        try {
+            const res = await fetch(`${process.env.NEXT_PUBLIC_APP_URL}/api/file/${fileId}`);
+            const json = await res.json();
+            const contentBinary = json?.data?.contentBinary;
+
+            if(contentBinary?.data?.length){
+              const bytes = new Uint8Array(contentBinary.data);
+              Y.applyUpdate(newDoc, bytes);
+              console.log(`[file:join] hydrated Y.Doc for ${fileId} from DB`);
+            }
+        } catch (error) {
+          console.error(`[file:join] Failed to hydrate ${fileId} from DB: `,error);
+        }
         docs.set(fileId, newDoc);
       }
+      const doc = docs.get(fileId)!;
+      // if(doc){
+        const state = Y.encodeStateAsUpdate(doc);
+        socket.emit("file:update-raw", state);
+      // }else{
+      //   const newDoc = new Y.Doc();
+      //   newDoc.getXmlFragment("document-content");
+      //   docs.set(fileId, newDoc);
+      // }
     });
 
     
