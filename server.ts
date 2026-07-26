@@ -38,6 +38,11 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Health check for uptime monitoring
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
 const server = http.createServer(app);
 
 const redisUrl = new URL(process.env.REDIS_URL || "redis://localhost:6379");
