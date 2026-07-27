@@ -22,19 +22,19 @@ This is a standalone Express + Socket.io server, deployed independently from the
 4. **Title-editing presence** — prevents two users from renaming the same folder/file/flashcard set at the same time
 5. **Cross-service event relay** — receives HTTP calls from the main Next.js app and the background worker, and re-broadcasts them to connected browser clients as live socket events
 
-It exists as a separate deployment because a serverless platform (Vercel, where the main app runs) cannot host a long-running process that keeps WebSocket connections open — this server has to stay alive continuously, which is why it's deployed on Railway instead.
+It exists as a separate deployment because a serverless platform (Vercel, where the main app runs) cannot host a long-running process that keeps WebSocket connections open — this server has to stay alive continuously, which is why it's deployed on Render instead.
 
 ---
 
 ## Why This Is a Separate Repo/Service
 
-| | Main app (`studysprout`, Vercel) | This server (Railway) |
+| | Main app (`studysprout`, Vercel) | This server (Render) |
 |---|---|---|
 | Execution model | Request/response, serverless | Long-running process |
 | Can hold open WebSocket connections | No | Yes |
-| Deployment | Vercel | Railway |
+| Deployment | Vercel | Render |
 
-Vercel functions spin up per-request and get frozen/killed between invocations — a Socket.io server needs to sit and hold thousands of open connections continuously, which is structurally incompatible with that model. Railway gives it a normal, always-on container instead.
+Vercel functions spin up per-request and get frozen/killed between invocations — a Socket.io server needs to sit and hold thousands of open connections continuously, which is structurally incompatible with that model. Render gives it a normal, always-on container instead.
 
 ---
 
