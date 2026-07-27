@@ -43,27 +43,27 @@ Vercel functions spin up per-request and get frozen/killed between invocations �
 ### Connection to the main app and worker
 
 ```
-┌─────────────────────┐                    ┌──────────────────────┐
-│  Browser (client)     │◄──── WebSocket ──►│  This server           │
-│  Yjs doc + Socket.io   │                    │  Socket.io + Yjs mirror │
+┌─────────────────────┐                    ┌──────────────────────  ┐
+│  Browser (client)   │◄──── WebSocket ──► │  This server           │
+│  Yjs doc + Socket.io│                    │  Socket.io + Yjs mirror│
 └─────────────────────┘                    └──────────┬─────────────┘
-                                                        │
-                          ┌─────────────────────────────┼───────────────────────┐
-                          │                              │                        │
+                                                      │
+                          ┌───────────────────────────┼───────────────────────┐
+                          │                           │                       │
                     HTTP POST                    enqueue job                emit HTTP
                     /emit/* endpoints            (file-sync-queue)          calls received
                           │                              │                   from worker
-                          ▼                              ▼                        │
+                          ▼                              ▼                       │
               ┌─────────────────────┐         ┌───────────────────┐              │
-              │  Next.js API routes  │         │   Shared Redis      │              │
-              │  (main repo, Vercel) │         │   (BullMQ)           │◄─────────────┘
-              └─────────────────────┘         └─────────┬───────────┘
-                                                          │ consumed by
-                                                          ▼
+              │  Next.js API routes │         │   Shared Redis    │              │
+              │  (main repo, Vercel)│         │   (BullMQ)        │◄─────────────┘
+              └─────────────────────┘         └─────────┬─────────┘
+                                                        │ consumed by
+                                                        ▼
                                               ┌─────────────────────────┐
-                                              │  Background workers       │
-                                              │  (main repo, Railway)      │
-                                              │  writes to MongoDB          │
+                                              │  Background workers     │
+                                              │  (main repo, Railway)   │
+                                              │  writes to MongoDB      │
                                               └─────────────────────────┘
 ```
 
@@ -74,6 +74,9 @@ Vercel functions spin up per-request and get frozen/killed between invocations �
 3. **Main repo (API routes + worker) → this server (HTTP)** — both the Next.js API routes and the background worker make outbound POST calls to this server's `/emit/*` endpoints whenever something needs to be pushed live to connected browsers (a new file finishing PDF processing, a flashcard set completing, a workspace invitation arriving)
 
 This server never calls anything in the main repo directly — it only *receives* HTTP calls from it, and *sends* jobs to the shared queue. There's no reverse dependency.
+
+Separately, the main repo's flashcard-generation route calls the standalone [`rate-limiter`](https://github.com/ArtiGaund/rate-limiter) Java service (also on Render) before making a Gemini API call — this server is not involved in that check.
+
 
 ---
 
@@ -124,6 +127,8 @@ socket.on("request_gen_start", ({ resourceId, parentId, workspaceId }) => {
 
 Locks auto-release after 5 minutes as a safety net in case a client disconnects mid-generation ("ghost lock protection"), and every lock state change is broadcast to the whole workspace so progress bars stay in sync for everyone watching.
 
+Note: this lock prevents *concurrent* generation of the same resource. It's a separate concern from the rate limiter, which prevents *repeated* generation requests over time regardless of concurrency — see the main [`studysprout`](https://github.com/ArtiGaund/studysprout) README for that mechanism.
+
 ### 5. Title-Editing Presence
 
 A lightweight three-event flow (`start` / `typing` / `stop`) broadcasts when someone begins editing a folder/file/flashcard set's title, so other clients can show "someone's renaming this" rather than two people racing to submit conflicting names.
@@ -171,9 +176,9 @@ Runs on `http://localhost:4000` by default. You'll also want the [main `studyspr
 
 ## Deployment
 
-Deployed independently on Railway (Nixpacks auto-detects the Node.js app, no Docker required):
+Deployed as submodule of Studysprout on Railway (Nixpacks auto-detects the Node.js app, no Docker required):
 
-1. Railway → New Project → Deploy from GitHub → select this repo
+1. Render → New Web Service → Deploy from GitHub → select this repo
 2. Set environment variables (above) in Railway's Variables tab
 3. Ensure `PORT` is read dynamically (`process.env.PORT`), not hardcoded — Railway assigns it at runtime
 
@@ -192,6 +197,7 @@ Deployed independently on Railway (Nixpacks auto-detects the Node.js app, no Doc
 ## Related
 
 - **Main application**: [`studysprout`](https://github.com/ArtiGaund/studysprout) — Next.js app, API routes, background workers, PDF pipeline, concept graph, flashcards
+- **Rate limiter**: [`rate-limiter`](https://github.com/ArtiGaund/rate-limiter) — standalone Java service rate-limiting Gemini API calls
 - **Live demo**: [studysprouts.vercel.app](https://studysprouts.vercel.app)
 
 ## License
