@@ -1,12 +1,12 @@
 # StudySprout Realtime Server ⚡
 
-> The real-time collaboration backbone for [StudySprout](https://studysprouts.vercel.app) — Socket.io + Yjs powered live editing, presence, and generation locking.
+> The real-time collaboration backbone for [StudySprout](https://studysprouts.in/) — Socket.io + Yjs powered live editing, presence, and generation locking.
 
 [![Node.js](https://img.shields.io/badge/Node.js-Express-339933?logo=node.js)](https://nodejs.org/)
 [![Socket.io](https://img.shields.io/badge/Socket.io-realtime-010101?logo=socket.io)](https://socket.io/)
 [![Yjs](https://img.shields.io/badge/Yjs-CRDT-yellow)](https://github.com/yjs/yjs)
 
-**Live app this powers:** [studysprouts.vercel.app](https://studysprouts.vercel.app)
+**Live app this powers:** [studysprouts.in](https://studysprouts.in/)
 **Main repo:** [`studysprout`](https://github.com/ArtiGaund/studysprout) — the Next.js app, API routes, and background workers this server communicates with
 **This repo:** `github.com/ArtiGaund/studysprout-realtime-server` *(replace with your actual URL)*
 
