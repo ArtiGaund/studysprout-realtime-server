@@ -201,7 +201,9 @@ Deployed as submodule of Studysprout on Railway (Nixpacks auto-detects the Node.
 - **Live demo**: [studysprouts.vercel.app](https://studysprouts.vercel.app)
 
 ## License
-MIT
+This project is not open source. The code is publicly viewable for portfolio 
+purposes, but all rights are reserved — please do not copy, reuse, or 
+redistribute without permission.
 
 ## Contact
 **Your Name** — [LinkedIn](https://linkedin.com/in/artigaund) · [Email](mailto:artigaund2210@gmail.com)
