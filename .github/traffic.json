@@ -141,5 +141,16 @@
       "uniques": 10,
       "count": 15
     }
+  },
+  {
+    "views": {
+      "uniques": 2,
+      "count": 5
+    },
+    "timestamp": "2026-08-07T00:00:00Z",
+    "clones": {
+      "uniques": 20,
+      "count": 28
+    }
   }
 ]
