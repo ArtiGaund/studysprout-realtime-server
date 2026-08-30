@@ -15,7 +15,7 @@ import "dotenv/config";
 import config from "./config/config";
 import { decode } from "next-auth/jwt";
 import cors from "cors";
-import { ConnectionOptions, Queue } from "bullmq";
+import { ConnectionOptions, Queue, QueueEvents } from "bullmq";
 import * as Y from "yjs";
 import Redis, { RedisOptions } from "ioredis";
 
@@ -80,6 +80,10 @@ const saveTimers = new Map<string, NodeJS.Timeout>();
 
 // Queue for pushing file updates back to the Next.js main database
 const fileSyncQueue = new Queue("file-sync-queue", { 
+  connection: redisClient as any
+});
+
+const fileSyncQueueEvents = new QueueEvents("file-sync-queue", {
   connection: redisClient as any
 });
 
@@ -462,7 +466,7 @@ io.on("connection", (socket) => {
         newDoc.getXmlFragment("document-content");
 
         try {
-            const res = await fetch(`${process.env.NEXT_PUBLIC_APP_URL}/api/file/${fileId}`);
+            const res = await fetch(`${process.env.MAIN_API_URL}/api/file/${fileId}`);
             const json = await res.json();
             const contentBinary = json?.data?.contentBinary;
             if(contentBinary?.data?.length){
@@ -520,6 +524,15 @@ io.on("connection", (socket) => {
           }
         );
       saveTimers.delete(fileId);
+      // CLEANUP AFTER SAVE: Check if room is empty now that save completed
+      const activeUsers = activeFileUsers.get(fileId);
+      if (!activeUsers || activeUsers.size === 0) {
+        if (docs.has(fileId)) {
+          const docToDestroy = docs.get(fileId);
+          docToDestroy?.destroy();
+          docs.delete(fileId);
+        }
+      }
     }, 2000);
 
     saveTimers.set(fileId, timer);
@@ -558,6 +571,23 @@ io.on("connection", (socket) => {
       // Cleanup empty file rooms
       if(usersInFile.size === 0){
         activeFileUsers.delete(fileId);
+
+        // --- SAFE MEMORY CLEANUP ---
+        // Check if there is a pending save timer for this file
+        const pendingTimer = saveTimers.get(fileId);
+
+        if (pendingTimer) {
+          // A save is scheduled! Let the timer finish, then destroy doc from RAM
+          // We leave the doc in RAM for now; the setTimeout callback inside file:update-raw
+          // will finish the persistence job.
+        } else {
+          // No save pending! Safe to immediately release from memory
+          if (docs.has(fileId)) {
+            const doc = docs.get(fileId);
+            doc?.destroy(); // Free Yjs internal memory allocations
+            docs.delete(fileId);
+          }
+        }
       }else{
         // Broadcast updated list
         const presenceList = Array.from(usersInFile.values()).map(user => ({
@@ -584,6 +614,7 @@ io.on("connection", (socket) => {
     *   Removes user from presence maps and releases any active AI locks held by this socket
     */
   socket.on("disconnect", reason => {
+    logMemoryUsage(`Disconnect (${socket.id})`);
     const user = socket.data.user;
     if(!user) return;
     const userId = user._id;
@@ -612,7 +643,7 @@ io.on("connection", (socket) => {
     }
 
     // 2. Optimized File Presence Cleanup
-    if(socket.data.currentFile){
+    if(socket.data.currentFileId){
         const fileId = socket.data.currentFileId;
         const usersInFile = activeFileUsers.get(fileId);
 
@@ -624,7 +655,15 @@ io.on("connection", (socket) => {
             usersInFile.delete(userId);
           }
           if(usersInFile.size === 0){
-            activeFileUsers.delete(userId);
+            activeFileUsers.delete(fileId);
+
+            // Trigger RAM cleanup check for docs here if needed
+            const pendingTimer = saveTimers.get(fileId);
+            if (!pendingTimer && docs.has(fileId)) {
+              const doc = docs.get(fileId);
+              doc?.destroy();
+              docs.delete(fileId);
+            }
           }else{
             io.to(`file:${fileId}`).emit("file:presence", 
               Array.from(usersInFile.values()).map(u => ({
@@ -641,9 +680,6 @@ io.on("connection", (socket) => {
     for(const [resId, state ] of activeGenerationLocks.entries()){
       if(state.ownerId === socket.id){
         activeGenerationLocks.delete(resId);
-        // io.to(`workspace:${state.workspaceId}`).emit("gen_completed", {
-        //   resourceId: resId,
-        // });
         broadcastWorkspaceLocks(state.workspaceId);
       }
     }
@@ -1028,8 +1064,166 @@ app.post("/api/socket/emit", (req, res) => {
   return res.json({ ok: true });
 });
 
+app.post("/emit/apply-inbox-block", async (req, res) => {
+  const { fileId,block, blocks, userId, workspaceId } = req.body;
+
+  // Accept either a single block object or an array of blocks
+  const blockstoApply = Array.isArray(blocks) && blocks.length > 0
+    ? blocks : (block ? [block] : []);
+
+  if(!fileId || blockstoApply.length === 0){
+    return res.status(400).json({
+      error: "FileId and atleast one valid block are required",
+    });
+  }
+
+  // Basic validation check for block structure
+  for(const b of blockstoApply){
+    if(!b?.id || !b?.type){
+      return res.status(400).json({
+        error: "Each block must contain an id and a type property",
+      });
+    }
+  }
+  try {
+    let doc = docs.get(fileId);
+    if(!doc){
+      const appUrl = process.env.MAIN_API_URL;
+      if(!appUrl){
+        console.error("[apply-inbox-block] MAIN_APP_URL not set - refusing to merge to avoid data loss");
+        return res.status(500).json({ error: "Server misconfigured: APP_URL not set"});
+      }
+      const newDoc = new Y.Doc();
+      // newDoc.getXmlFragment("document-content");
+      try {
+        const fetchRes = await fetch(`${appUrl}/api/file/${fileId}`);
+        const json = await fetchRes.json();
+        const contentBinary = json?.data?.contentBinary;
+        if(contentBinary?.data?.length){
+          Y.applyUpdate(newDoc, new Uint8Array(contentBinary.data));
+        }
+      } catch (err) {
+        console.error(`[apply-inbox-block] Failed to hydrate ${fileId}: `,err);
+        return res.status(502).json({ error: "Failed to hydrate file content before merge"});
+      }
+      docs.set(fileId, newDoc);
+      doc = newDoc;
+    }
+    
+    doc.transact(() => {
+      const fragment = doc.getXmlFragment("document-content");
+
+      let blockGroup = fragment.toArray().find(
+        (node): node is Y.XmlElement =>
+          node instanceof Y.XmlElement && node.nodeName === "blockGroup"
+      );
+      if (!blockGroup) {
+        blockGroup = new Y.XmlElement("blockGroup");
+        fragment.push([blockGroup]);
+      }
+
+      for (const item of blockstoApply) {
+        // 1. Create and push blockContainer to doc FIRST
+        const container = new Y.XmlElement("blockContainer");
+        container.setAttribute("id", item.id);
+        blockGroup.push([container]);
+
+        // 2. Create inner element and push to container
+        const inner = new Y.XmlElement(item.type);
+        for (const [key, value] of Object.entries(item.props ?? {})) {
+          if (value !== undefined && value !== null) {
+            inner.setAttribute(key, String(value));
+          }
+        }
+        container.push([inner]);
+
+        // 3. Add text/styles now that inner is attached to doc
+        if (Array.isArray(item.content) && item.content.length > 0) {
+          item.content.forEach((c: any) => {
+            if (c.text) {
+              const xmlText = new Y.XmlText(c.text);
+              inner.push([xmlText]);
+
+              if (c.styles && typeof c.styles === "object") {
+                for (const [styleKey, styleValue] of Object.entries(c.styles)) {
+                  if (styleValue) {
+                    xmlText.format(0, c.text.length, { [styleKey]: styleValue });
+                  }
+                }
+              }
+            }
+          });
+        } else if (item.plainText && item.plainText.length > 0) {
+          const xmlText = new Y.XmlText(item.plainText);
+          inner.push([xmlText]);
+        }
+      }
+    });
+   
+    const update = Y.encodeStateAsUpdate(doc);
+    io.to(`file:${fileId}`).emit("file:update-raw", update);
+
+    if(workspaceId){
+      io.to(`workspace:${workspaceId}`).emit("workspace:tree:update", {
+        type: "file_content_updated",
+        payload: { fileId },
+      });
+    }
+
+    clearTimeout(saveTimers.get(fileId));
+    saveTimers.delete(fileId);
+
+    // Queue persistence job for BullMQ background worker
+    const firstBlockId = blockstoApply[0].id;
+    const jobId = `inbox-merge-${fileId}-${firstBlockId}-${Date.now()}`;
+
+    const state = Y.encodeStateAsUpdate(doc);
+    const job = await fileSyncQueue.add(
+      "persist-file",
+      {
+        fileId,
+        contentBinary: Buffer.from(state).toString("base64"),
+        userId,
+      },
+      {
+        jobId,
+        removeOnComplete: true 
+      }
+    );
+
+    try {
+      await job.waitUntilFinished(fileSyncQueueEvents, 15000);
+    } catch (waitError) {
+      console.error(`[apply-inbox-block] Worker did not confirm persistence for ${fileId}: `,waitError);
+      return res.status(504).json({
+        error: "Timed out waiting for file to be saved"
+      });
+    }
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("[apply-inbox-block] error: ",error);
+    return res.status(500).json({ error: "Failed to apply block" });
+  }
+});
+
 /** Start the realtime server */
 const PORT = 4000;
+// --- Add Memory Monitoring Here ---
+function logMemoryUsage(label: string = "") {
+  const mem = process.memoryUsage();
+  const rssMB = (mem.rss / 1024 / 1024).toFixed(2);
+  const heapMB = (mem.heapUsed / 1024 / 1024).toFixed(2);
+}
+
+// Log initial footprint on server startup
+logMemoryUsage("Server Startup");
+
+// Log automatically every 15 seconds
+setInterval(() => {
+  logMemoryUsage("Periodic");
+}, 15000);
+// ----------------------------------
 server.listen(PORT, () => {
   console.log("Realtime server running on port", PORT);
 });
